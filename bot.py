@@ -110,6 +110,12 @@ def act(page, row, action):
     target.get_by_role('link', name=name, exact=True).click(timeout=20000)
 
 
+def no_ticket(page, dialogs=()):
+    """Recognize the site's explicit no-ticket response without guessing."""
+    text = '\n'.join([page.locator('body').inner_text(timeout=10000), *dialogs]).lower()
+    return any(marker in text for marker in ('票据不足', '票不足', '无可用票', '没有可用票', 'no tickets available', 'no ticket available', 'insufficient tickets'))
+
+
 def run(args):
     from playwright.sync_api import sync_playwright
     student = os.environ['XMU_STUNO']
@@ -128,7 +134,11 @@ def run(args):
         context = browser.new_context(storage_state=auth, timezone_id='Asia/Shanghai')
         page = context.new_page()
         # Do not auto-accept unknown confirmation wording. Log no raw page or credential data.
-        page.on('dialog', lambda dialog: dialog.dismiss())
+        dialogs = []
+        def dismiss_dialog(dialog):
+            dialogs.append(dialog.message)
+            dialog.dismiss()
+        page.on('dialog', dismiss_dialog)
         rows = scan(page, student)
         actions = plan(rows, datetime.now(CST), args.mode, state['items'])
         counts = {}
@@ -169,8 +179,16 @@ def run(args):
                     state['items'][item_id]['phase'] = 'cancel_pending'
                 # Write ahead: uncertain outcomes must not cause repeated booking.
                 save_state(path, state)
+                dialogs.clear()
                 act(page, row, kind)
+                insufficient = kind == 'reserve' and no_ticket(page, dialogs)
                 after = {r['id']: r for r in scan(page, student)}.get(item_id)
+                if insufficient and after and after['status'] == 'unreserved':
+                    del state['items'][item_id]
+                    save_state(path, state)
+                    print('No ticket available; ending this run normally.')
+                    browser.close()
+                    return
                 expected = ('waiting', 'won') if kind == 'reserve' else ('unreserved',)
                 if not after or after['status'] not in expected:
                     raise RuntimeError('Action outcome unconfirmed; manual review required')
