@@ -1,0 +1,3 @@
+playwright>=1.51,<2
+cryptography>=44,<47
+
