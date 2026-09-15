@@ -1,0 +1,86 @@
+name: Lecture automation
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [reserve, results]
+        default: reserve
+      apply:
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 16 * * *'
+    - cron: '10 22 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: lecture-automation
+  cancel-in-progress: false
+jobs:
+  run:
+    if: github.event_name == 'workflow_dispatch' || vars.AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Restore encrypted state
+        run: |
+          mkdir -p runtime
+          if git ls-remote --exit-code --heads origin automation-state >/dev/null; then
+            git fetch origin automation-state
+            git show FETCH_HEAD:state.enc > runtime/state.enc
+          else
+            result=$?
+            if [ "$result" != 2 ]; then exit "$result"; fi
+          fi
+      - name: Run
+        env:
+          XMU_STUNO: ${{ secrets.XMU_STUNO }}
+          XMU_STORAGE_STATE: ${{ secrets.XMU_STORAGE_STATE }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+          QQ_SMTP_CODE: ${{ secrets.QQ_SMTP_CODE }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          MODE: ${{ inputs.mode }}
+          APPLY: ${{ inputs.apply }}
+        shell: bash
+        run: |
+          if [ "$EVENT" = schedule ]; then
+            APPLY=true
+            if [ "$SCHEDULE" = '0 16 * * *' ]; then MODE=reserve; else MODE=results; fi
+          fi
+          flags=()
+          if [ "$APPLY" = true ]; then flags+=(--apply); fi
+          python bot.py "$MODE" "${flags[@]}"
+      - name: Persist encrypted state even after failure
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s runtime/state.enc ]; then exit 0; fi
+          cp runtime/state.enc "$RUNNER_TEMP/lecture-state.enc"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git show-ref --verify --quiet refs/remotes/origin/automation-state; then
+            git checkout -B automation-state origin/automation-state
+          else
+            git checkout --orphan automation-state
+            git rm -rf --cached .
+          fi
+          cp "$RUNNER_TEMP/lecture-state.enc" state.enc
+          git add -f state.enc
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update encrypted automation state'
+            git push origin HEAD:automation-state
+          fi
